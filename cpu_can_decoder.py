@@ -149,18 +149,22 @@ class CPUCANDecoder:
     
     def process_and_save(self, input_path: str, output_dir: str):
         """
-        Process CAN data from numpy files and save as Parquet
+        Process CAN data from raw_can directory and save as Parquet
+        
+        Args:
+            input_path: Path to raw_can directory containing t, address, data files
+            output_dir: Output directory for Parquet files
         """
         import os
         os.makedirs(output_dir, exist_ok=True)
         
         print("CPU CANデコーダー実行開始...")
         
-        # Load data
-        data = np.load(input_path)
-        timestamps = data['arr_0']
-        addresses = data['arr_1']
-        data_bytes = data['arr_2']
+        # Load data from individual files (comma2k19 format)
+        timestamps = np.fromfile(os.path.join(input_path, 't'), dtype=np.float64)
+        addresses = np.fromfile(os.path.join(input_path, 'address'), dtype=np.int64)
+        data_raw = np.fromfile(os.path.join(input_path, 'data'), dtype=np.uint8)
+        data_bytes = data_raw.reshape(-1, 8)  # Each CAN message has 8 bytes
         
         print(f"入力データ: {len(timestamps):,} メッセージ")
         
