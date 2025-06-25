@@ -116,58 +116,53 @@ class OptimizedGPUCANDecoder:
     def _process_single_chunk(self, timestamps: np.ndarray, addresses: np.ndarray, 
                              data_bytes: np.ndarray, stream: cp.cuda.Stream) -> cudf.DataFrame:
         """
-        cuDF直接読み込み - カリカリチューニング版（デバッグ付き）
+        超最適化版 - 無駄な処理を完全排除
         """
         import time
         total_start = time.time()
         
-        # 1. 本当に1回の転送
+        # 1. CPU側で事前フィルタリング（最速）
         step_start = time.time()
-        # まずNumPyで連結してから1回でGPUに転送
-        combined_data = np.column_stack([
-            timestamps,
-            addresses.astype(np.float64),  # 型統一
-            data_bytes
-        ])
-        print(f"  NumPy連結: {time.time() - step_start:.4f}秒")
+        wheel_mask = addresses == 170
+        wheel_indices = np.where(wheel_mask)[0]
+        print(f"  CPU事前フィルタリング: {time.time() - step_start:.4f}秒")
         
-        # 1回のcuDF転送
-        step_start = time.time()
-        df = cudf.DataFrame(combined_data, columns=[
-            'timestamp', 'address', 'byte0', 'byte1', 'byte2', 'byte3', 'byte4', 'byte5', 'byte6', 'byte7'
-        ])
-        print(f"  cuDF作成: {time.time() - step_start:.4f}秒")
-        
-        # address列を整数に戻す
-        step_start = time.time()
-        df['address'] = df['address'].astype('int64')
-        print(f"  型変換: {time.time() - step_start:.4f}秒")
-        
-        # 2. 車輪速度フィルタリング（cuDF直接操作）
-        step_start = time.time()
-        wheel_df = df[df['address'] == 170].copy()
-        print(f"  フィルタリング: {time.time() - step_start:.4f}秒")
-        
-        if len(wheel_df) == 0:
+        if len(wheel_indices) == 0:
             return cudf.DataFrame()
         
-        # 3. 速度計算（cuDF vectorized操作 - GPUネイティブ）
-        # OpenPilot DBC: (0.01, -67.67) "kph" for Toyota RAV4
-        # raw_value = (speed_kmh + 67.67) / 0.01
-        # speed_kmh = raw_value * 0.01 - 67.67
-        
-        # 16bit値の復元（cuDF対応版）
+        # 2. 必要なデータのみ抽出
         step_start = time.time()
-        front_left_raw = wheel_df['byte1'].astype('uint16') * 256 + wheel_df['byte0'].astype('uint16')
-        front_right_raw = wheel_df['byte3'].astype('uint16') * 256 + wheel_df['byte2'].astype('uint16') 
-        rear_left_raw = wheel_df['byte5'].astype('uint16') * 256 + wheel_df['byte4'].astype('uint16')
-        rear_right_raw = wheel_df['byte7'].astype('uint16') * 256 + wheel_df['byte6'].astype('uint16')
+        wheel_timestamps = timestamps[wheel_indices]
+        wheel_data = data_bytes[wheel_indices]
+        print(f"  データ抽出: {time.time() - step_start:.4f}秒")
+        
+        # 3. 直接cuDF作成（型変換なし、copyなし）
+        step_start = time.time()
+        df = cudf.DataFrame({
+            'timestamp': wheel_timestamps,
+            'byte0': wheel_data[:, 0],
+            'byte1': wheel_data[:, 1],
+            'byte2': wheel_data[:, 2],
+            'byte3': wheel_data[:, 3],
+            'byte4': wheel_data[:, 4],
+            'byte5': wheel_data[:, 5],
+            'byte6': wheel_data[:, 6],
+            'byte7': wheel_data[:, 7]
+        })
+        print(f"  cuDF作成: {time.time() - step_start:.4f}秒")
+        
+        # 4. GPU上で速度計算（copyなし）
+        step_start = time.time()
+        front_left_raw = df['byte1'].astype('uint16') * 256 + df['byte0'].astype('uint16')
+        front_right_raw = df['byte3'].astype('uint16') * 256 + df['byte2'].astype('uint16') 
+        rear_left_raw = df['byte5'].astype('uint16') * 256 + df['byte4'].astype('uint16')
+        rear_right_raw = df['byte7'].astype('uint16') * 256 + df['byte6'].astype('uint16')
         print(f"  16bit復元: {time.time() - step_start:.4f}秒")
         
-        # km/hからm/sに変換（3.6で割る）
+        # 5. 最終結果作成
         step_start = time.time()
         result_df = cudf.DataFrame({
-            'timestamp': wheel_df['timestamp'].reset_index(drop=True),
+            'timestamp': df['timestamp'],
             'front_left': (front_left_raw * 0.01 - 67.67) / 3.6,
             'front_right': (front_right_raw * 0.01 - 67.67) / 3.6,
             'rear_left': (rear_left_raw * 0.01 - 67.67) / 3.6,
