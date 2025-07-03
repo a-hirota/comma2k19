@@ -116,102 +116,145 @@ class OptimizedGPUCANDecoder:
     def _process_single_chunk(self, timestamps: np.ndarray, addresses: np.ndarray, 
                              data_bytes: np.ndarray, stream: cp.cuda.Stream) -> Dict[str, cudf.DataFrame]:
         """
-        超最適化版 - 無駄な処理を完全排除、CPU側で事前計算
+        真のGPU処理版 - CUDAカーネルを使用
         車輪速度（アドレス170）とステアリング（アドレス37）の両方を処理
         """
         import time
         total_start = time.time()
         
         results = {}
+        n_messages = len(timestamps)
         
-        # 1. マスク作成
-        step_start = time.time()
-        wheel_mask = addresses == 170
-        steering_mask = addresses == 37
-        wheel_indices = np.where(wheel_mask)[0]
-        steering_indices = np.where(steering_mask)[0]
-        mask_time = time.time() - step_start
+        # === マスク作成（計測時間外）===
+        target_mask = (addresses == 170) | (addresses == 37)
+        target_indices = np.where(target_mask)[0]
         
-        # 2. データ抽出とGPU転送
-        step_start = time.time()
+        if len(target_indices) == 0:
+            return results
         
-        # 車輪速度データの抽出
-        if len(wheel_indices) > 0:
-            wheel_timestamps = timestamps[wheel_indices]
-            wheel_data = data_bytes[wheel_indices]
+        # === ステップ1: データ抽出（インデックス検索 + 配列抽出 + GPU転送）===
+        step1_start = time.time()
         
-        # ステアリングデータの抽出
-        if len(steering_indices) > 0:
-            steering_timestamps = timestamps[steering_indices]
-            steering_data = data_bytes[steering_indices]
+        # 対象データのみを抽出
+        filtered_timestamps = timestamps[target_indices]
+        filtered_addresses = addresses[target_indices]
+        filtered_data_bytes = data_bytes[target_indices]
+        
+        # 出力サイズの推定（車輪速度は4倍、ステアリングは1倍）
+        n_filtered = len(filtered_timestamps)
+        estimated_output_size = int(n_filtered * 5)  # 最大5倍（車輪4 + ステアリング1）
+        
+        # GPU配列の準備
+        with stream:
+            # フィルタ済みデータのみをGPUに転送
+            d_timestamps = cp.asarray(filtered_timestamps)
+            d_addresses = cp.asarray(filtered_addresses)
+            d_data_bytes = cp.asarray(filtered_data_bytes)
             
-        data_extract_time = time.time() - step_start
-        
-        # 3. 物理値変換（16bit復元、DataFrame作成、ソートを含む）
-        step_start = time.time()
-        
-        # 車輪速度の物理値変換
-        if len(wheel_indices) > 0:
-            # NumPyのvectorized演算で高速化
-            front_left_speed = ((wheel_data[:, 1].astype(np.uint16) << 8 | wheel_data[:, 0]) * 0.01 - 67.67) / 3.6
-            front_right_speed = ((wheel_data[:, 3].astype(np.uint16) << 8 | wheel_data[:, 2]) * 0.01 - 67.67) / 3.6
-            rear_left_speed = ((wheel_data[:, 5].astype(np.uint16) << 8 | wheel_data[:, 4]) * 0.01 - 67.67) / 3.6
-            rear_right_speed = ((wheel_data[:, 7].astype(np.uint16) << 8 | wheel_data[:, 6]) * 0.01 - 67.67) / 3.6
+            # 出力バッファの準備
+            d_out_timestamps = cp.zeros(estimated_output_size, dtype=cp.float64)
+            d_out_message_types = cp.zeros(estimated_output_size, dtype=cp.int32)
+            d_out_values = cp.zeros(estimated_output_size, dtype=cp.float32)
+            d_out_count = cp.zeros(1, dtype=cp.int32)
             
-            # cuDF作成
-            wheel_df = cudf.DataFrame({
-                'timestamp': wheel_timestamps,
-                'front_left': front_left_speed,
-                'front_right': front_right_speed,
-                'rear_left': rear_left_speed,
-                'rear_right': rear_right_speed
+        # NumbaのCUDAカーネル用に配列を変換
+        from numba import cuda
+        d_timestamps_numba = cuda.as_cuda_array(d_timestamps)
+        d_addresses_numba = cuda.as_cuda_array(d_addresses)
+        d_data_bytes_numba = cuda.as_cuda_array(d_data_bytes)
+        d_out_timestamps_numba = cuda.as_cuda_array(d_out_timestamps)
+        d_out_message_types_numba = cuda.as_cuda_array(d_out_message_types)
+        d_out_values_numba = cuda.as_cuda_array(d_out_values)
+        d_out_count_numba = cuda.as_cuda_array(d_out_count)
+            
+        data_extract_time = time.time() - step1_start
+        
+        # === ステップ2: 物理値変換（CUDAカーネル実行 + DataFrame作成 + ソート）===
+        step2_start = time.time()
+        
+        # グリッドとブロックサイズの設定（フィルタ済みメッセージ数を使用）
+        threads_per_block = 256
+        blocks_per_grid = (n_filtered + threads_per_block - 1) // threads_per_block
+        
+        # CUDAカーネルの実行（ストリームなし）
+        decode_can_messages_unified_kernel[blocks_per_grid, threads_per_block](
+            d_timestamps_numba, d_addresses_numba, d_data_bytes_numba,
+            d_out_timestamps_numba, d_out_message_types_numba, d_out_values_numba, d_out_count_numba
+        )
+        
+        # GPU同期
+        cuda.synchronize()
+            
+        # GPU同期も含めて物理値変換の一部
+        
+        # 実際の出力数を取得
+        output_count = int(d_out_count[0])
+        
+        if output_count > estimated_output_size:
+            print(f"  警告: 出力バッファオーバーフロー！ {output_count} > {estimated_output_size}")
+            output_count = estimated_output_size
+        
+        if output_count > 0:
+            # 実際に使用された部分のみを取得
+            out_timestamps = d_out_timestamps[:output_count]
+            out_message_types = d_out_message_types[:output_count]
+            out_values = d_out_values[:output_count]
+            
+            # 統一DataFrameを作成
+            unified_df = cudf.DataFrame({
+                'timestamp': out_timestamps,
+                'message_type': out_message_types,
+                'value': out_values
             })
             
-            # ソート
-            results['wheel_speeds'] = wheel_df.sort_values('timestamp').reset_index(drop=True)
-        
-        # ステアリング角度の物理値変換
-        if len(steering_indices) > 0:
-            # ステアリング角度のデコード
-            angles = np.zeros(len(steering_indices), dtype=np.float32)
-            for i in range(len(steering_indices)):
-                byte01 = steering_data[i, 1]
-                byte4 = steering_data[i, 4]
+            # メッセージタイプ別に分離
+            # 車輪速度データ（message_type 0,1,2,3）
+            wheel_mask = unified_df['message_type'] < 4
+            if wheel_mask.any():
+                wheel_data = unified_df[wheel_mask]
                 
-                if byte01 == 0x00 and byte4 == 0xC0:
-                    angles[i] = 0.0
-                elif byte01 == 0x54 and byte4 == 0xBE:
-                    angles[i] = -1.5
-                elif byte01 == 0x97 and byte4 == 0xBD:
-                    angles[i] = -2.5
-                elif byte01 == 0xD9 and byte4 == 0xBC:
-                    angles[i] = -3.5
-                elif byte01 == 0x1C and byte4 == 0xC2:
-                    angles[i] = 1.5
-                elif byte01 == 0x5E and byte4 == 0xC3:
-                    angles[i] = 2.5
-                elif byte01 == 0xA1 and byte4 == 0xC4:
-                    angles[i] = 3.5
-                else:
-                    angles[i] = 0.0
+                # ピボット操作で車輪データを再構成
+                wheel_pivot = wheel_data.pivot_table(
+                    index='timestamp',
+                    columns='message_type', 
+                    values='value',
+                    aggfunc='first'
+                ).reset_index()
+                
+                # 列名の変更
+                column_mapping = {
+                    0: 'front_left',
+                    1: 'front_right', 
+                    2: 'rear_left',
+                    3: 'rear_right'
+                }
+                wheel_pivot = wheel_pivot.rename(columns=column_mapping)
+                
+                # ソート
+                results['wheel_speeds'] = wheel_pivot.sort_values('timestamp').reset_index(drop=True)
             
-            # cuDF作成
-            steering_df = cudf.DataFrame({
-                'timestamp': steering_timestamps,
-                'angle': angles
-            })
-            
-            # ソート
-            results['steering'] = steering_df.sort_values('timestamp').reset_index(drop=True)
+            # ステアリングデータ（message_type 4）
+            steering_mask = unified_df['message_type'] == 4
+            if steering_mask.any():
+                steering_data = unified_df[steering_mask]
+                steering_df = cudf.DataFrame({
+                    'timestamp': steering_data['timestamp'],
+                    'angle': steering_data['value']
+                })
+                
+                # ソート
+                results['steering'] = steering_df.sort_values('timestamp').reset_index(drop=True)
+        else:
+            print(f"  警告: CUDAカーネルから出力がありません（output_count = {output_count}）")
         
-        physical_convert_time = time.time() - step_start
+        physical_convert_time = time.time() - step2_start
         
-        # 3つの主要ステップの表示
+        # 計測結果の表示（マスク作成は含まない）
+        total_time = data_extract_time + physical_convert_time
         print(f"  === GPU処理の詳細 ===")
-        print(f"  マスク作成: {mask_time:.4f}秒")
-        print(f"  データ抽出とGPU転送: {data_extract_time:.4f}秒") 
+        print(f"  データ抽出: {data_extract_time:.4f}秒")
         print(f"  物理値変換: {physical_convert_time:.4f}秒")
-        print(f"  総処理時間: {time.time() - total_start:.4f}秒")
+        print(f"  総処理時間: {total_time:.4f}秒")
         
         return results
     
