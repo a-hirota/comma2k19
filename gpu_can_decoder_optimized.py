@@ -362,6 +362,7 @@ class OptimizedGPUCANDecoder:
         # 車輪速度データ
         if all_results['wheel_speeds']:
             wheel_speeds_df = cudf.concat(all_results['wheel_speeds'], ignore_index=True)
+            # タイムスタンプでソート（重要！）
             wheel_speeds_df = wheel_speeds_df.sort_values('timestamp').reset_index(drop=True)
             
             output_path = os.path.join(output_dir, "wheel_speeds.parquet")
@@ -374,6 +375,9 @@ class OptimizedGPUCANDecoder:
                 'speed': (wheel_speeds_df['front_left'] + wheel_speeds_df['front_right'] + 
                          wheel_speeds_df['rear_left'] + wheel_speeds_df['rear_right']) / 4.0
             })
+            # 車両速度もソート
+            vehicle_speed_df = vehicle_speed_df.sort_values('timestamp').reset_index(drop=True)
+            
             output_path = os.path.join(output_dir, "vehicle_speed.parquet")
             vehicle_speed_df.to_parquet(output_path)
             print(f"Saved: {output_path} ({len(vehicle_speed_df)} rows)")
@@ -381,6 +385,7 @@ class OptimizedGPUCANDecoder:
         # ステアリングデータ
         if all_results['steering']:
             steering_df = cudf.concat(all_results['steering'], ignore_index=True)
+            # タイムスタンプでソート（重要！）
             steering_df = steering_df.sort_values('timestamp').reset_index(drop=True)
             
             output_path = os.path.join(output_dir, "steering.parquet")
