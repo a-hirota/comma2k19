@@ -114,47 +114,96 @@ class OptimizedGPUCANDecoder:
         return int(n_messages * 0.04)
     
     def _process_single_chunk(self, timestamps: np.ndarray, addresses: np.ndarray, 
-                             data_bytes: np.ndarray, stream: cp.cuda.Stream) -> cudf.DataFrame:
+                             data_bytes: np.ndarray, stream: cp.cuda.Stream) -> Dict[str, cudf.DataFrame]:
         """
         超最適化版 - 無駄な処理を完全排除、CPU側で事前計算
+        車輪速度（アドレス170）とステアリング（アドレス37）の両方を処理
         """
         import time
         total_start = time.time()
         
+        results = {}
+        
         # 1. マスク作成
         step_start = time.time()
         wheel_mask = addresses == 170
+        steering_mask = addresses == 37
         wheel_indices = np.where(wheel_mask)[0]
+        steering_indices = np.where(steering_mask)[0]
         mask_time = time.time() - step_start
         
-        if len(wheel_indices) == 0:
-            return cudf.DataFrame()
-        
-        # 2. データ抽出とGPU転送（CPU事前フィルタリング、データ抽出、cuDF作成を含む）
+        # 2. データ抽出とGPU転送
         step_start = time.time()
-        wheel_timestamps = timestamps[wheel_indices]
-        wheel_data = data_bytes[wheel_indices]
+        
+        # 車輪速度データの抽出
+        if len(wheel_indices) > 0:
+            wheel_timestamps = timestamps[wheel_indices]
+            wheel_data = data_bytes[wheel_indices]
+        
+        # ステアリングデータの抽出
+        if len(steering_indices) > 0:
+            steering_timestamps = timestamps[steering_indices]
+            steering_data = data_bytes[steering_indices]
+            
         data_extract_time = time.time() - step_start
         
         # 3. 物理値変換（16bit復元、DataFrame作成、ソートを含む）
         step_start = time.time()
-        # NumPyのvectorized演算で高速化
-        front_left_speed = ((wheel_data[:, 1].astype(np.uint16) << 8 | wheel_data[:, 0]) * 0.01 - 67.67) / 3.6
-        front_right_speed = ((wheel_data[:, 3].astype(np.uint16) << 8 | wheel_data[:, 2]) * 0.01 - 67.67) / 3.6
-        rear_left_speed = ((wheel_data[:, 5].astype(np.uint16) << 8 | wheel_data[:, 4]) * 0.01 - 67.67) / 3.6
-        rear_right_speed = ((wheel_data[:, 7].astype(np.uint16) << 8 | wheel_data[:, 6]) * 0.01 - 67.67) / 3.6
         
-        # cuDF作成
-        result_df = cudf.DataFrame({
-            'timestamp': wheel_timestamps,
-            'front_left': front_left_speed,
-            'front_right': front_right_speed,
-            'rear_left': rear_left_speed,
-            'rear_right': rear_right_speed
-        })
+        # 車輪速度の物理値変換
+        if len(wheel_indices) > 0:
+            # NumPyのvectorized演算で高速化
+            front_left_speed = ((wheel_data[:, 1].astype(np.uint16) << 8 | wheel_data[:, 0]) * 0.01 - 67.67) / 3.6
+            front_right_speed = ((wheel_data[:, 3].astype(np.uint16) << 8 | wheel_data[:, 2]) * 0.01 - 67.67) / 3.6
+            rear_left_speed = ((wheel_data[:, 5].astype(np.uint16) << 8 | wheel_data[:, 4]) * 0.01 - 67.67) / 3.6
+            rear_right_speed = ((wheel_data[:, 7].astype(np.uint16) << 8 | wheel_data[:, 6]) * 0.01 - 67.67) / 3.6
+            
+            # cuDF作成
+            wheel_df = cudf.DataFrame({
+                'timestamp': wheel_timestamps,
+                'front_left': front_left_speed,
+                'front_right': front_right_speed,
+                'rear_left': rear_left_speed,
+                'rear_right': rear_right_speed
+            })
+            
+            # ソート
+            results['wheel_speeds'] = wheel_df.sort_values('timestamp').reset_index(drop=True)
         
-        # ソート
-        result = result_df.sort_values('timestamp').reset_index(drop=True)
+        # ステアリング角度の物理値変換
+        if len(steering_indices) > 0:
+            # ステアリング角度のデコード
+            angles = np.zeros(len(steering_indices), dtype=np.float32)
+            for i in range(len(steering_indices)):
+                byte01 = steering_data[i, 1]
+                byte4 = steering_data[i, 4]
+                
+                if byte01 == 0x00 and byte4 == 0xC0:
+                    angles[i] = 0.0
+                elif byte01 == 0x54 and byte4 == 0xBE:
+                    angles[i] = -1.5
+                elif byte01 == 0x97 and byte4 == 0xBD:
+                    angles[i] = -2.5
+                elif byte01 == 0xD9 and byte4 == 0xBC:
+                    angles[i] = -3.5
+                elif byte01 == 0x1C and byte4 == 0xC2:
+                    angles[i] = 1.5
+                elif byte01 == 0x5E and byte4 == 0xC3:
+                    angles[i] = 2.5
+                elif byte01 == 0xA1 and byte4 == 0xC4:
+                    angles[i] = 3.5
+                else:
+                    angles[i] = 0.0
+            
+            # cuDF作成
+            steering_df = cudf.DataFrame({
+                'timestamp': steering_timestamps,
+                'angle': angles
+            })
+            
+            # ソート
+            results['steering'] = steering_df.sort_values('timestamp').reset_index(drop=True)
+        
         physical_convert_time = time.time() - step_start
         
         # 3つの主要ステップの表示
@@ -164,23 +213,25 @@ class OptimizedGPUCANDecoder:
         print(f"  物理値変換: {physical_convert_time:.4f}秒")
         print(f"  総処理時間: {time.time() - total_start:.4f}秒")
         
-        return result
+        return results
     
     def decode_batch(self, timestamps: np.ndarray, addresses: np.ndarray, 
-                    data_bytes: np.ndarray) -> List[cudf.DataFrame]:
+                    data_bytes: np.ndarray) -> Dict[str, List[cudf.DataFrame]]:
         """
         バッチをチャンクに分割して並列処理
         
         Returns:
-            チャンク数分のDataFrameリスト
+            メッセージタイプごとのDataFrameリストを含む辞書
         """
         n_messages = len(timestamps)
-        chunk_results = []
+        chunk_results = {'wheel_speeds': [], 'steering': []}
         
         if self.chunk_size == 1:
             # チャンク分割なし - 1回の完全な処理
             result = self._process_single_chunk(timestamps, addresses, data_bytes, self.streams[0])
-            chunk_results.append(result)
+            for key, df in result.items():
+                if df is not None:
+                    chunk_results[key].append(df)
         else:
             # チャンク分割処理
             chunk_length = n_messages // self.chunk_size
@@ -203,7 +254,9 @@ class OptimizedGPUCANDecoder:
                     chunk_timestamps, chunk_addresses, chunk_data_bytes, 
                     self.streams[i % len(self.streams)]
                 )
-                chunk_results.append(result)
+                for key, df in result.items():
+                    if df is not None:
+                        chunk_results[key].append(df)
             
             # 全ストリーム同期
             for stream in self.streams:
@@ -290,7 +343,7 @@ class OptimizedGPUCANDecoder:
         # バッチ処理
         start_time = __import__('time').time()
         
-        all_chunk_results = []
+        all_results = {'wheel_speeds': [], 'steering': []}
         for i in range(0, len(timestamps), self.batch_size):
             end_idx = min(i + self.batch_size, len(timestamps))
             print(f"  処理中: {i:,} - {end_idx:,}")
@@ -300,56 +353,62 @@ class OptimizedGPUCANDecoder:
                 addresses[i:end_idx],
                 data_bytes[i:end_idx]
             )
-            all_chunk_results.extend(batch_results)
+            
+            # 結果を統合
+            for key, df_list in batch_results.items():
+                all_results[key].extend(df_list)
         
-        # チャンク結果の統合
-        if all_chunk_results:
-            if self.chunk_size == 1:
-                # チャンク分割なしの場合
-                unified_df = all_chunk_results[0]
-            else:
-                # 複数チャンクの結合
-                unified_df = cudf.concat(all_chunk_results, ignore_index=True)
-                unified_df = unified_df.sort_values('timestamp').reset_index(drop=True)
+        # データの結合と保存
+        # 車輪速度データ
+        if all_results['wheel_speeds']:
+            wheel_speeds_df = cudf.concat(all_results['wheel_speeds'], ignore_index=True)
+            wheel_speeds_df = wheel_speeds_df.sort_values('timestamp').reset_index(drop=True)
             
-            # メッセージタイプ別に分割
-            results = self._split_unified_dataframe(unified_df)
+            output_path = os.path.join(output_dir, "wheel_speeds.parquet")
+            wheel_speeds_df.to_parquet(output_path)
+            print(f"Saved: {output_path} ({len(wheel_speeds_df)} rows)")
             
-            # Parquet保存
-            for name, df in results.items():
-                if df is not None and len(df) > 0:
-                    output_path = os.path.join(output_dir, f"{name}_optimized.parquet")
-                    df.to_parquet(output_path)
-                    print(f"Saved: {output_path} ({len(df)} rows)")
+            # 車両速度の計算と保存
+            vehicle_speed_df = cudf.DataFrame({
+                'timestamp': wheel_speeds_df['timestamp'],
+                'speed': (wheel_speeds_df['front_left'] + wheel_speeds_df['front_right'] + 
+                         wheel_speeds_df['rear_left'] + wheel_speeds_df['rear_right']) / 4.0
+            })
+            output_path = os.path.join(output_dir, "vehicle_speed.parquet")
+            vehicle_speed_df.to_parquet(output_path)
+            print(f"Saved: {output_path} ({len(vehicle_speed_df)} rows)")
+        
+        # ステアリングデータ
+        if all_results['steering']:
+            steering_df = cudf.concat(all_results['steering'], ignore_index=True)
+            steering_df = steering_df.sort_values('timestamp').reset_index(drop=True)
+            
+            output_path = os.path.join(output_dir, "steering.parquet")
+            steering_df.to_parquet(output_path)
+            print(f"Saved: {output_path} ({len(steering_df)} rows)")
         
         elapsed_time = __import__('time').time() - start_time
         print(f"\n処理時間: {elapsed_time:.3f} 秒")
         print(f"スループット: {len(timestamps) / elapsed_time / 1e6:.2f} Mmessages/sec")
 
 
-# 従来のインターフェースとの互換性
-class GPUCANDecoder(OptimizedGPUCANDecoder):
-    """従来のGPUCANDecoderとの互換性を保つラッパー"""
-    
-    def decode_batch(self, timestamps: np.ndarray, addresses: np.ndarray, 
-                    data_bytes: np.ndarray) -> Dict[str, cudf.DataFrame]:
+    def decode_batch_for_benchmark(self, timestamps: np.ndarray, addresses: np.ndarray, 
+                                  data_bytes: np.ndarray) -> List[cudf.DataFrame]:
         """
-        従来のインターフェース互換性のためのラッパー
+        ベンチマーク用の簡易インターフェース（車輪速度データのみ）
         """
-        chunk_results = super().decode_batch(timestamps, addresses, data_bytes)
+        results_dict = self.decode_batch(timestamps, addresses, data_bytes)
         
-        if not chunk_results:
-            return {}
-        
-        # 単一の統一DataFrameに結合
-        if len(chunk_results) == 1:
-            unified_df = chunk_results[0]
+        # 車輪速度データのみを返す（ベンチマーク用）
+        if results_dict['wheel_speeds']:
+            if len(results_dict['wheel_speeds']) == 1:
+                return results_dict['wheel_speeds']
+            else:
+                # 複数チャンクの場合は結合
+                combined_df = cudf.concat(results_dict['wheel_speeds'], ignore_index=True)
+                return [combined_df.sort_values('timestamp').reset_index(drop=True)]
         else:
-            unified_df = cudf.concat(chunk_results, ignore_index=True)
-            unified_df = unified_df.sort_values('timestamp').reset_index(drop=True)
-        
-        # 従来の形式に変換
-        return self._split_unified_dataframe(unified_df)
+            return [cudf.DataFrame()]
 
 
 if __name__ == "__main__":
