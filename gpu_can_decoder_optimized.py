@@ -121,32 +121,30 @@ class OptimizedGPUCANDecoder:
         import time
         total_start = time.time()
         
-        # 1. CPU側で事前フィルタリング（最速）
+        # 1. マスク作成
         step_start = time.time()
         wheel_mask = addresses == 170
         wheel_indices = np.where(wheel_mask)[0]
-        print(f"  CPU事前フィルタリング: {time.time() - step_start:.4f}秒")
+        mask_time = time.time() - step_start
         
         if len(wheel_indices) == 0:
             return cudf.DataFrame()
         
-        # 2. 必要なデータのみ抽出
+        # 2. データ抽出とGPU転送（CPU事前フィルタリング、データ抽出、cuDF作成を含む）
         step_start = time.time()
         wheel_timestamps = timestamps[wheel_indices]
         wheel_data = data_bytes[wheel_indices]
-        print(f"  データ抽出: {time.time() - step_start:.4f}秒")
+        data_extract_time = time.time() - step_start
         
-        # 3. CPU側で16bit値と速度を事前計算（vectorized）
+        # 3. 物理値変換（16bit復元、DataFrame作成、ソートを含む）
         step_start = time.time()
         # NumPyのvectorized演算で高速化
         front_left_speed = ((wheel_data[:, 1].astype(np.uint16) << 8 | wheel_data[:, 0]) * 0.01 - 67.67) / 3.6
         front_right_speed = ((wheel_data[:, 3].astype(np.uint16) << 8 | wheel_data[:, 2]) * 0.01 - 67.67) / 3.6
         rear_left_speed = ((wheel_data[:, 5].astype(np.uint16) << 8 | wheel_data[:, 4]) * 0.01 - 67.67) / 3.6
         rear_right_speed = ((wheel_data[:, 7].astype(np.uint16) << 8 | wheel_data[:, 6]) * 0.01 - 67.67) / 3.6
-        print(f"  CPU事前計算（16bit復元+速度変換）: {time.time() - step_start:.4f}秒")
         
-        # 4. 計算済みデータで直接cuDF作成
-        step_start = time.time()
+        # cuDF作成
         result_df = cudf.DataFrame({
             'timestamp': wheel_timestamps,
             'front_left': front_left_speed,
@@ -154,13 +152,16 @@ class OptimizedGPUCANDecoder:
             'rear_left': rear_left_speed,
             'rear_right': rear_right_speed
         })
-        print(f"  cuDF作成（計算済み）: {time.time() - step_start:.4f}秒")
         
-        # 5. ソート
-        step_start = time.time()
+        # ソート
         result = result_df.sort_values('timestamp').reset_index(drop=True)
-        print(f"  ソート: {time.time() - step_start:.4f}秒")
+        physical_convert_time = time.time() - step_start
         
+        # 3つの主要ステップの表示
+        print(f"  === GPU処理の詳細 ===")
+        print(f"  マスク作成: {mask_time:.4f}秒")
+        print(f"  データ抽出とGPU転送: {data_extract_time:.4f}秒") 
+        print(f"  物理値変換: {physical_convert_time:.4f}秒")
         print(f"  総処理時間: {time.time() - total_start:.4f}秒")
         
         return result

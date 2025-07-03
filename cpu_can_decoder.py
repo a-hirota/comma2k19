@@ -145,9 +145,18 @@ class CPUCANDecoder:
         
         # 車輪速度のデコード
         t0 = time.time()
-        wheel_data = self.decode_wheel_speeds(timestamps, addresses, data_bytes)
+        wheel_result = self.decode_wheel_speeds(timestamps, addresses, data_bytes, return_timing=True)
+        if wheel_result is None:
+            wheel_data = None
+            wheel_timing = {}
+        else:
+            wheel_data, wheel_timing = wheel_result
         t1 = time.time()
         timing_info['wheel_decode'] = t1 - t0
+        
+        # 詳細タイミング情報を追加
+        if wheel_timing:
+            timing_info.update(wheel_timing)
         
         if wheel_data is not None:
             t2 = time.time()
