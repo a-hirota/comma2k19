@@ -99,7 +99,7 @@ class OptimizedGPUCANDecoder:
         self.pool = rmm.mr.PoolMemoryResource(
             rmm.mr.CudaMemoryResource(),
             initial_pool_size=512<<20,  # 512MB
-            maximum_pool_size=2<<30     # 2GB
+            maximum_pool_size=2<<30     # 20GB
         )
         rmm.mr.set_current_device_resource(self.pool)
         
@@ -116,7 +116,7 @@ class OptimizedGPUCANDecoder:
     def _process_single_chunk(self, timestamps: np.ndarray, addresses: np.ndarray, 
                              data_bytes: np.ndarray, stream: cp.cuda.Stream) -> cudf.DataFrame:
         """
-        超最適化版 - 無駄な処理を完全排除
+        超最適化版 - 無駄な処理を完全排除、CPU側で事前計算
         """
         import time
         total_start = time.time()
@@ -136,40 +136,27 @@ class OptimizedGPUCANDecoder:
         wheel_data = data_bytes[wheel_indices]
         print(f"  データ抽出: {time.time() - step_start:.4f}秒")
         
-        # 3. 直接cuDF作成（型変換なし、copyなし）
+        # 3. CPU側で16bit値と速度を事前計算（vectorized）
         step_start = time.time()
-        df = cudf.DataFrame({
-            'timestamp': wheel_timestamps,
-            'byte0': wheel_data[:, 0],
-            'byte1': wheel_data[:, 1],
-            'byte2': wheel_data[:, 2],
-            'byte3': wheel_data[:, 3],
-            'byte4': wheel_data[:, 4],
-            'byte5': wheel_data[:, 5],
-            'byte6': wheel_data[:, 6],
-            'byte7': wheel_data[:, 7]
-        })
-        print(f"  cuDF作成: {time.time() - step_start:.4f}秒")
+        # NumPyのvectorized演算で高速化
+        front_left_speed = ((wheel_data[:, 1].astype(np.uint16) << 8 | wheel_data[:, 0]) * 0.01 - 67.67) / 3.6
+        front_right_speed = ((wheel_data[:, 3].astype(np.uint16) << 8 | wheel_data[:, 2]) * 0.01 - 67.67) / 3.6
+        rear_left_speed = ((wheel_data[:, 5].astype(np.uint16) << 8 | wheel_data[:, 4]) * 0.01 - 67.67) / 3.6
+        rear_right_speed = ((wheel_data[:, 7].astype(np.uint16) << 8 | wheel_data[:, 6]) * 0.01 - 67.67) / 3.6
+        print(f"  CPU事前計算（16bit復元+速度変換）: {time.time() - step_start:.4f}秒")
         
-        # 4. GPU上で速度計算（copyなし）
-        step_start = time.time()
-        front_left_raw = df['byte1'].astype('uint16') * 256 + df['byte0'].astype('uint16')
-        front_right_raw = df['byte3'].astype('uint16') * 256 + df['byte2'].astype('uint16') 
-        rear_left_raw = df['byte5'].astype('uint16') * 256 + df['byte4'].astype('uint16')
-        rear_right_raw = df['byte7'].astype('uint16') * 256 + df['byte6'].astype('uint16')
-        print(f"  16bit復元: {time.time() - step_start:.4f}秒")
-        
-        # 5. 最終結果作成
+        # 4. 計算済みデータで直接cuDF作成
         step_start = time.time()
         result_df = cudf.DataFrame({
-            'timestamp': df['timestamp'],
-            'front_left': (front_left_raw * 0.01 - 67.67) / 3.6,
-            'front_right': (front_right_raw * 0.01 - 67.67) / 3.6,
-            'rear_left': (rear_left_raw * 0.01 - 67.67) / 3.6,
-            'rear_right': (rear_right_raw * 0.01 - 67.67) / 3.6
+            'timestamp': wheel_timestamps,
+            'front_left': front_left_speed,
+            'front_right': front_right_speed,
+            'rear_left': rear_left_speed,
+            'rear_right': rear_right_speed
         })
-        print(f"  結果DataFrame: {time.time() - step_start:.4f}秒")
+        print(f"  cuDF作成（計算済み）: {time.time() - step_start:.4f}秒")
         
+        # 5. ソート
         step_start = time.time()
         result = result_df.sort_values('timestamp').reset_index(drop=True)
         print(f"  ソート: {time.time() - step_start:.4f}秒")

@@ -21,25 +21,38 @@ class CPUCANDecoder:
         """
         self.batch_size = batch_size
         
-    def decode_wheel_speeds(self, timestamps, addresses, data_bytes):
+    def decode_wheel_speeds(self, timestamps, addresses, data_bytes, return_timing=False):
         """
         車輪速度メッセージのデコード (アドレス 170)
         OpenPilot DBC: Toyota RAV4用 (0.01,-67.67) "kph"
         """
+        timing = {}
+        t0 = time.time()
+        
         # 車輪速度メッセージを検索
         wheel_mask = addresses == 170
+        t1 = time.time()
+        timing['mask_creation'] = t1 - t0
+        
         wheel_indices = np.where(wheel_mask)[0]
+        t2 = time.time()
+        timing['index_search'] = t2 - t1
         
         if len(wheel_indices) == 0:
+            if return_timing:
+                return None, timing
             return None
             
         # 出力配列の事前割り当て
         n_messages = len(wheel_indices)
+        t3 = time.time()
         out_timestamps = timestamps[wheel_indices]
         out_front_left = np.zeros(n_messages, dtype=np.float32)
         out_front_right = np.zeros(n_messages, dtype=np.float32)
         out_rear_left = np.zeros(n_messages, dtype=np.float32)
         out_rear_right = np.zeros(n_messages, dtype=np.float32)
+        t4 = time.time()
+        timing['array_allocation'] = t4 - t3
         
         # 各メッセージのデコード
         for i, idx in enumerate(wheel_indices):
@@ -58,14 +71,22 @@ class CPUCANDecoder:
             # 後右輪 (バイト 6-7)
             raw_value = (int(data_bytes[idx, 6]) << 8) | int(data_bytes[idx, 7])
             out_rear_right[i] = (raw_value * 0.01 - 67.67) / 3.6
-            
-        return {
+        
+        t5 = time.time()
+        timing['decode_loop'] = t5 - t4
+        timing['total'] = t5 - t0
+        
+        result = {
             'timestamp': out_timestamps,
             'front_left': out_front_left,
             'front_right': out_front_right,
             'rear_left': out_rear_left,
             'rear_right': out_rear_right
         }
+        
+        if return_timing:
+            return result, timing
+        return result
     
     def decode_steering_angle(self, timestamps, addresses, data_bytes):
         """
@@ -112,7 +133,7 @@ class CPUCANDecoder:
         }
     
     def decode_batch(self, timestamps: np.ndarray, addresses: np.ndarray, 
-                    data_bytes: np.ndarray) -> Dict[str, pd.DataFrame]:
+                    data_bytes: np.ndarray, debug_timing: bool = False) -> Dict[str, pd.DataFrame]:
         """
         CPU上でCANメッセージのバッチをデコード
         
@@ -120,21 +141,35 @@ class CPUCANDecoder:
             各メッセージタイプのデコードされたDataFrameの辞書
         """
         results = {}
+        timing_info = {}
         
         # 車輪速度のデコード
+        t0 = time.time()
         wheel_data = self.decode_wheel_speeds(timestamps, addresses, data_bytes)
+        t1 = time.time()
+        timing_info['wheel_decode'] = t1 - t0
+        
         if wheel_data is not None:
+            t2 = time.time()
             wheel_df = pd.DataFrame(wheel_data)
+            t3 = time.time()
+            timing_info['wheel_df_creation'] = t3 - t2
+            
             # タイムスタンプでソート
             wheel_df = wheel_df.sort_values('timestamp').reset_index(drop=True)
+            t4 = time.time()
+            timing_info['wheel_sort'] = t4 - t3
             results['wheel_speeds'] = wheel_df
             
             # 車両速度の計算（4輪の平均）
+            t5 = time.time()
             vehicle_speed_df = pd.DataFrame({
                 'timestamp': wheel_df['timestamp'],
                 'speed': (wheel_df['front_left'] + wheel_df['front_right'] + 
                          wheel_df['rear_left'] + wheel_df['rear_right']) / 4.0
             })
+            t6 = time.time()
+            timing_info['vehicle_speed_calc'] = t6 - t5
             results['vehicle_speed'] = vehicle_speed_df
         
         # ステアリング角度のデコード
@@ -145,6 +180,8 @@ class CPUCANDecoder:
             steering_df = steering_df.sort_values('timestamp').reset_index(drop=True)
             results['steering'] = steering_df
             
+        if debug_timing:
+            results['_timing'] = timing_info
         return results
     
     def process_and_save(self, input_path: str, output_dir: str):
